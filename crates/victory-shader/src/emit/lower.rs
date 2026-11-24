@@ -220,11 +220,26 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// In a program with nested loops, the iterations of all its loops
+    /// instead (the counters' phis are then not used).
+    total: Option<Total>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
+/// The iterations a lane made in all of the program's loops.
+#[derive(Default)]
+struct Total {
+    /// At each IR block's start.
+    at: HashMap<usize, V>,
+    /// Of those, the phis: (phi, block).
+    phis: Vec<(V, usize)>,
+    /// Past each back edge (from, to).
+    back: HashMap<(usize, usize), V>,
+}
+
+/// Iterations after which a loop is left (per entry into it; those of
+/// nested loops count together, or they would multiply), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
@@ -514,6 +529,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            total: None,
             abort: None,
         }
     }
@@ -835,6 +851,7 @@ impl<'a> Lower<'a> {
             });
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
+        self.total = self.has_nested_loops(&order).then(Total::default);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -842,7 +859,11 @@ impl<'a> Lower<'a> {
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
             if header {
                 let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
+                let phi = if self.total.is_some() {
+                    self.s.m.i32(0)
+                } else {
+                    self.s.m.phi(blk, self.s.t.i32)
+                };
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
@@ -862,6 +883,7 @@ impl<'a> Lower<'a> {
                 .copied()
                 .filter(|&q| self.block[q].is_some())
                 .collect();
+            self.start_total(b, &preds);
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
@@ -6823,7 +6845,9 @@ impl<'a> Lower<'a> {
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
     fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
+        if self.total.is_none()
+            && let Some((_, incoming)) = self.counters.get_mut(&to)
+        {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
@@ -6834,16 +6858,65 @@ impl<'a> Lower<'a> {
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
-        let (phi, _) = self.counters[&to];
+        let count = match &self.total {
+            Some(total) => total.at[&self.cur_ir],
+            None => self.counters[&to].0,
+        };
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        let next = self.s.m.bin(c, Bin::Add, count, one);
         let limit = self.s.m.i32(super::loop_limit());
+        if let Some(total) = &mut self.total {
+            total.back.insert((self.cur_ir, to), next);
+            return self.s.m.cmp(c, p, next, limit);
+        }
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// Whether a loop lies inside another.
+    fn has_nested_loops(&self, order: &[usize]) -> bool {
+        let blocks = &self.x.p.blocks;
+        let reachable = |b: usize| self.block[b].is_some();
+        let back = |from: usize, to: usize| self.rpo[to] <= self.rpo[from];
+        let latches = |h: usize| {
+            let preds = blocks[h].preds.iter().copied();
+            preds.filter(move |&q| reachable(q) && back(q, h))
+        };
+        order.iter().any(|&header| {
+            // The loop's blocks: those that reach a latch not through the
+            // header.
+            let mut work: Vec<usize> = latches(header).collect();
+            let mut seen = HashSet::from([header]);
+            while let Some(b) = work.pop() {
+                if !seen.insert(b) {
+                    continue;
+                }
+                if latches(b).next().is_some() {
+                    return true;
+                }
+                work.extend(blocks[b].preds.iter().copied().filter(|&q| reachable(q)));
+            }
+            false
+        })
+    }
+
+    /// At IR block `b`'s start: the iterations so far, joined from `preds`.
+    fn start_total(&mut self, b: usize, preds: &[usize]) {
+        let Some(total) = &mut self.total else { return };
+        let at = match *preds {
+            [] => self.s.m.i32(0),
+            [q] if self.rpo[q] < self.rpo[b] => total.at[&q],
+            _ => {
+                let phi = self.s.m.phi(self.cur, self.s.t.i32);
+                total.phis.push((phi, b));
+                phi
+            }
+        };
+        total.at.insert(b, at);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -6922,8 +6995,22 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
-            self.s.m.set_phi(phi, incoming);
+        let counters = std::mem::take(&mut self.counters);
+        if let Some(total) = &self.total {
+            for &(phi, b) in &total.phis {
+                let mut incoming = Vec::new();
+                for &q in &p.blocks[b].preds {
+                    let Some(tail) = self.tail[q] else { continue };
+                    let from = self.edges.get(&(q, b)).copied().unwrap_or(tail);
+                    let count = total.back.get(&(q, b)).unwrap_or(&total.at[&q]);
+                    incoming.push((*count, from));
+                }
+                self.s.m.set_phi(phi, incoming);
+            }
+        } else {
+            for (phi, incoming) in counters.into_values() {
+                self.s.m.set_phi(phi, incoming);
+            }
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];

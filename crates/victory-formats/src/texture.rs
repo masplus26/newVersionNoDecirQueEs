@@ -594,7 +594,31 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        let all = |_: usize, _: usize| true;
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, all, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    /// [`Layout::detile`] of what lies in the byte ranges `changed` of
+    /// `tiled` (in order, apart from each other); the rest of `linear`,
+    /// which an earlier call filled, stays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_changed(
+        &self,
+        tiled: &[u8],
+        changed: &[std::ops::Range<usize>],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let wanted = |from: usize, to: usize| {
+            let next = changed.partition_point(|c| c.end <= from);
+            changed.get(next).is_some_and(|c| c.start < to)
+        };
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, wanted, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
@@ -609,12 +633,15 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        let all = |_: usize, _: usize| true;
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, all, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// Visits contiguous runs as (tiled byte offset, linear byte offset,
+    /// length): those whose tiled bytes `[from, to)` are `wanted`, which is
+    /// asked about whole rows first.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -624,6 +651,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        wanted: impl Fn(usize, usize) -> bool,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -671,18 +699,28 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // How far a row's bytes reach past its base.
+        let reach = runs.iter().map(|&(t, _, len)| t + len).max().unwrap_or(0);
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
+                    let tiled_row = (base + u64::from(y) * u64::from(m.pitch) * n as u64) as usize;
+                    if wanted(tiled_row, tiled_row + bytes) {
+                        copy(tiled_row, linear_row, bytes);
+                    }
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    if !wanted(tiled_row, tiled_row + reach) {
+                        continue;
+                    }
                     for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                        let from = tiled_row + tiled;
+                        if wanted(from, from + len) {
+                            copy(from, linear_row + linear, len);
+                        }
                     }
                 }
             }
@@ -921,6 +959,20 @@ mod tests {
                     l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
                     let mut back = vec![0xcc; linear.len()];
                     l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
+                    // In two halves of alternating odd ranges: the same.
+                    let mut parts = vec![0xcc; back.len()];
+                    l.detile_changed(&tiled, &[], mip, slice, &mut parts, row, plane).unwrap();
+                    assert!(parts.iter().all(|&b| b == 0xcc));
+                    let whole: Vec<_> = (0..tiled.len())
+                        .step_by(333)
+                        .map(|at| at..(at + 333).min(tiled.len()))
+                        .collect();
+                    for half in [0, 1] {
+                        let changed: Vec<_> = whole.iter().skip(half).step_by(2).cloned().collect();
+                        l.detile_changed(&tiled, &changed, mip, slice, &mut parts, row, plane)
+                            .unwrap();
+                    }
+                    assert!(parts == back, "{d:?} mip {mip} slice {slice}");
                     for z in 0..m.depth {
                         let base = z as usize * plane;
                         for y in 0..m.height {

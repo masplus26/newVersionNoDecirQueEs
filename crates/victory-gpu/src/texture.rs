@@ -5,12 +5,13 @@
 //! staging buffer when its content changed, and the staging buffer is
 //! copied into the host texture.
 //!
-//! "Changed" means a page of the memory was written since the last detiling
+//! Only what changed is detiled again, by 64 KiB pages of the memory.
+//! "Changed" means the page was written since the last detiling
 //! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! which cannot be watched, a content hash of each page at every submission
+//! that samples the texture.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! shortcut: the staging buffer is copied whole into the host texture.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -22,6 +23,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+use crate::watch::PAGE;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -47,12 +49,12 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
+/// What a texture's staging buffer holds: the hash of each page detiled
 /// (memory not watched), or the write-watch asking it was detiled after,
 /// with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hashes: Vec<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
 }
@@ -169,6 +171,59 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+#[cfg(test)]
+impl Staging {
+    /// The state of a single-subresource texture outside any title resource.
+    pub(crate) fn for_bench(
+        host: &crate::host::Host,
+        layout: victory_formats::texture::Layout,
+        texture: &ID3D12Resource,
+        memory: *const u8,
+    ) -> Arc<Staging> {
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut total) = (0, 0);
+        // SAFETY: outputs for one subresource of a live texture.
+        unsafe {
+            let d = texture.GetDesc();
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut rows),
+                None,
+                Some(&mut total),
+            );
+        }
+        let (buffer, data) = host.upload_buffer(total).expect("upload memory");
+        Arc::new(Staging {
+            buffer,
+            #[cfg(feature = "diagnostics")]
+            size: total,
+            data,
+            footprints: vec![footprint],
+            rows: vec![rows],
+            layout,
+            mips: 1,
+            memory,
+            last: Mutex::default(),
+        })
+    }
+
+    /// Where the host texture is copied from.
+    pub(crate) fn source(&self) -> D3D12_TEXTURE_COPY_LOCATION {
+        D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: self.footprints[0],
+            },
+        }
+    }
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
@@ -188,19 +243,37 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let changed: Vec<_> = if last.asked == 0 {
+                std::iter::once(0..size).collect()
+            } else {
+                written
+                    .iter()
+                    .filter(|&&(_, w)| w > last.asked)
+                    .map(|&(page, _)| page_range(page * PAGE, start, size))
+                    .collect()
+            };
+            if changed.is_empty() {
                 return 0;
             }
             last.asked = now;
+            last.hashes.clear();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut read = 0;
+            for range in &changed {
+                let to = last.read[range.clone()].as_mut_ptr();
+                let from = self.memory.wrapping_add(range.start);
+                crate::host::copy_mapped(to, from, range.len(), false);
+                read += range.len();
+            }
+            self.detile(&last.read, &changed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+            return read;
         }
+        // Not watched (any more): all of it when it is again.
+        last.asked = 0;
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
@@ -213,21 +286,31 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        let hashes: Vec<_> = tiled.chunks(PAGE).map(blake3::hash).collect();
+        let changed: Vec<_> = hashes
+            .iter()
+            .enumerate()
+            .filter(|&(i, hash)| last.hashes.get(i) != Some(hash))
+            .map(|(i, _)| i * PAGE..((i + 1) * PAGE).min(size))
+            .collect();
+        if changed.is_empty() {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        last.hashes = hashes;
+        self.detile(tiled, &changed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        crate::copystat::add(
+            crate::copystat::C::TexChanged,
+            changed.iter().map(|r| r.len() as u64).sum(),
+        );
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles the byte ranges `changed` of `tiled` (the texture's memory)
+    /// into the staging buffer.
+    fn detile(&self, tiled: &[u8], changed: &[std::ops::Range<usize>]) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -247,13 +330,19 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile_changed(tiled, changed, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
     }
+}
+
+/// The part of the page at address `page` inside a texture's memory
+/// (`start`, `size`), as offsets.
+fn page_range(page: usize, start: usize, size: usize) -> std::ops::Range<usize> {
+    page.saturating_sub(start).min(size)..(page + PAGE).saturating_sub(start).min(size)
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -341,4 +430,109 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    const SIDE: u32 = 512;
+
+    fn host_texture(host: &crate::host::Host) -> ID3D12Resource {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: SIDE.into(),
+            Height: SIDE,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let mut made = None;
+        // SAFETY: plain creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)
+                .unwrap();
+        }
+        made.unwrap()
+    }
+
+    /// Title memory not at a page's start, write-watched or not, kept to the
+    /// end of the test process.
+    fn memory(size: usize, watched: bool) -> &'static mut [u8] {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SKEW: usize = 4096;
+        let flags = MEM_RESERVE | MEM_COMMIT | if watched { MEM_WRITE_WATCH } else { 0 };
+        // Whole pages, which the write watch is asked about.
+        let len = (size + SKEW).next_multiple_of(PAGE);
+        // SAFETY: a fresh allocation, never freed.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), len, flags, PAGE_READWRITE).cast::<u8>();
+            assert!(!p.is_null());
+            std::slice::from_raw_parts_mut(p.add(SKEW), size)
+        }
+    }
+
+    /// After writes anywhere, the staging buffer holds what detiling the
+    /// whole memory gives, and less than that was read.
+    #[test]
+    fn changes_are_brought_up_to_date_in_part() {
+        let Some(host) = host() else { return };
+        for (watched, swizzle) in [true, false]
+            .into_iter()
+            .flat_map(|w| [Swizzle::SW_64KB_S, Swizzle::SW_4KB_D, Swizzle::LINEAR].map(|s| (w, s)))
+        {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: SIDE,
+                height: SIDE,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let memory = memory(layout.size as usize, watched);
+            for (i, b) in memory.iter_mut().enumerate() {
+                *b = (i as u32).wrapping_mul(2_654_435_761).rotate_left(9) as u8;
+            }
+            let texture = host_texture(host);
+            let staging = Staging::for_bench(host, layout.clone(), &texture, memory.as_ptr());
+            let pitch = staging.footprints[0].Footprint.RowPitch as usize;
+            let check = || {
+                let mut whole = vec![0; pitch * SIDE as usize];
+                layout.detile(memory_of(&staging), 0, 0, &mut whole, pitch, 0).unwrap();
+                // SAFETY: the mapped staging buffer's one subresource.
+                let held = unsafe { std::slice::from_raw_parts(staging.data, whole.len()) };
+                assert!(held == whole, "watched {watched}, {swizzle:?}");
+            };
+            staging.refresh();
+            check();
+            let size = memory.len();
+            for at in [0, 1, PAGE - 4097, PAGE - 4096, PAGE, size / 2, size - 1] {
+                memory[at] ^= 0x5a;
+                memory[size - 1 - at / 3] ^= 0xa5;
+                let read = staging.refresh_now();
+                assert!(!watched || (1..size).contains(&read), "{read} of {size}");
+                check();
+            }
+            assert!(!watched || staging.refresh_now() == 0, "nothing written since");
+        }
+    }
+
+    fn memory_of(staging: &Staging) -> &[u8] {
+        // SAFETY: the test's memory, of the layout's size.
+        unsafe { std::slice::from_raw_parts(staging.memory, staging.layout.size as usize) }
+    }
 }

@@ -12,9 +12,12 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! While many are queued (a scene's first frames) the budget is about a
+//! frame's length: waiting half a second in each frame until hundreds are
+//! made held the title at 2 frames a second and got few of them drawn.
+//!
+//! shortcut: the budgets are guesses; a pass the title runs only once and
+//! whose pipeline takes longer is lost.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -94,8 +97,17 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, with few queued.
 const BUDGET: Duration = Duration::from_millis(500);
+/// The same with more than [`FEW`] queued.
+const BUSY_BUDGET: Duration = Duration::from_millis(33);
+/// Pipelines that may be queued for a frame to wait for them in full.
+const FEW: u64 = 16;
+
+/// Waiting allowed in a frame with `queued` pipelines to make.
+fn budget(queued: u64) -> Duration {
+    if queued > FEW { BUSY_BUDGET } else { BUDGET }
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -143,28 +155,35 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let started = Instant::now();
+    let waited = Duration::from_micros(WAITED_US.load(Ordering::Relaxed));
+    wait_up_to(p, || budget(waiting()).saturating_sub(waited));
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Waits for `p` at most `allowed` (asked again as pipelines are made and
+/// queued).
+fn wait_up_to(p: &Pending, allowed: impl Fn() -> Duration) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = allowed().saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
+/// Hands `p` to the workers (half the logical processors, 2 to 16), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 16));
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
@@ -221,6 +240,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many queued: a frame waits about its own length; few: much longer.
+    #[test]
+    fn a_long_queue_does_not_hold_frames() {
+        assert_eq!(budget(0), BUDGET);
+        assert_eq!(budget(FEW), BUDGET);
+        assert_eq!(budget(FEW + 1), BUSY_BUDGET);
+        let never = Pending::new(Vec::new(), None);
+        let started = Instant::now();
+        wait_up_to(&never, || budget(1200));
+        let took = started.elapsed();
+        assert!(took >= BUSY_BUDGET && took < BUDGET / 2, "{took:?}");
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

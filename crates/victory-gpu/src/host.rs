@@ -64,13 +64,13 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
+pub(crate) static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
+pub(crate) static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -176,12 +176,24 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(any(test, feature = "diagnostics"))
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Laptops list the integrated GPU first when it drives the
+            // display: ask for the fast one, then whatever is the default.
+            let fast = match fast_adapter() {
+                Ok(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = fast {
+                tracing::warn!(error = %e, "no high-performance adapter; using the default one");
+                device = None;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -226,6 +238,37 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// The system's high-performance GPU (the user's per-application graphics
+/// setting in Windows has the last word).
+fn fast_adapter() -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter1 =
+            factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+        let name = adapter.GetDesc1()?.Description;
+        let name = String::from_utf16_lossy(&name);
+        tracing::info!(adapter = name.trim_end_matches('\0'), "host GPU");
+        Ok(adapter)
+    }
+}
+
+/// The host copies the lists' shaders write, each once.
+fn written_by(runs: &[&HostList]) -> Vec<std::sync::Arc<crate::shadow::Shadow>> {
+    let mut written: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+    // One list's lock at a time: a submission may name a list twice.
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, ..) = step
+                && !written.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow))
+            {
+                written.push(shadow.clone());
+            }
+        }
+    }
+    written
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -251,6 +294,59 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes reach mapped title pages around an unmapped one, and the
+    /// write watch sees them.
+    #[test]
+    fn writes_leave_unmapped_pages_alone() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PIECE: usize = crate::watch::PAGE;
+        const SMALL: usize = 4096;
+        let len = 3 * PIECE;
+        // SAFETY: a fresh allocation with one 4 KiB hole, kept: the journal
+        // of writes would carry over to whoever got its address next.
+        unsafe {
+            let flags = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+            let p = VirtualAlloc(std::ptr::null(), len, flags, PAGE_READWRITE).cast::<u8>();
+            assert!(!p.is_null());
+            let hole = PIECE + 2 * SMALL;
+            assert_ne!(VirtualFree(p.add(hole).cast(), SMALL, MEM_DECOMMIT), 0);
+            let from = vec![5u8; len];
+            write_mapped(p, from.as_ptr(), len);
+            for at in [0, PIECE, hole - 1, hole + SMALL, 2 * PIECE, len - 1] {
+                assert_eq!(p.add(at).read(), 5, "{at}");
+            }
+            assert!(!crate::texture::committed(p, len), "the hole is still one");
+            // The kernel refuses to answer for a range with a hole.
+            let (_, seen) =
+                crate::watch::writes(p as usize + 2 * PIECE, p as usize + len, false).unwrap();
+            assert_eq!(seen.len(), 1);
+        }
+    }
+
+    /// The fast adapter has at least the default one's dedicated memory.
+    #[test]
+    fn fast_adapter_is_no_smaller_than_the_default() {
+        // SAFETY: plain DXGI adapter queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let (Ok(first), Ok(fast)) = (factory.EnumAdapters1(0), fast_adapter()) else {
+                return;
+            };
+            let (first, fast) = (first.GetDesc1().unwrap(), fast.GetDesc1().unwrap());
+            for (what, d) in [("default", &first), ("fast", &fast)] {
+                let name = String::from_utf16_lossy(&d.Description);
+                eprintln!("{what}: {}, {} MiB", name.trim_end_matches('\0'), d.DedicatedVideoMemory >> 20);
+            }
+            assert!(fast.DedicatedVideoMemory >= first.DedicatedVideoMemory);
+        }
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -489,8 +585,29 @@ impl Host {
         }
     }
 
+    /// Waits for everything submitted (`submitted`: the fence's last value).
+    fn wait(&self, submitted: &mut u64) {
+        *submitted += 1;
+        // SAFETY: the fence and event are ours.
+        unsafe {
+            let waited = self
+                .queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            match waited {
+                Ok(()) => {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -510,6 +627,8 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let back = written_by(runs);
+        let around = crate::vram::around(self, &back);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -525,22 +644,22 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            // Submitted apart, so that buffers are back in the common state
+            // between them and the title's lists.
+            let first = around.first.as_ref().filter(|_| i == 0);
+            let last = around.last.as_ref().filter(|_| i + 1 == groups.len());
+            // SAFETY: closed lists.
             unsafe {
+                if let Some(list) = first {
+                    self.queue.ExecuteCommandLists(&[Some(list.clone())]);
+                }
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Some(list) = last {
+                    self.queue.ExecuteCommandLists(&[Some(list.clone())]);
                 }
             }
+            self.wait(&mut submitted);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -575,27 +694,18 @@ impl Host {
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done; each copy once per
+        // submission, however many dispatches declared ranges of it (the
+        // world's passes declare overlapping big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        let brought = crate::vram::bring_back(self, &around, |list| {
+            // SAFETY: a closed list.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            self.wait(&mut submitted);
+        });
+        COPY_BACK[1].fetch_add(brought as u64, Ordering::Relaxed);
+        for shadow in &back {
+            COPY_BACK[1].fetch_add(shadow.copy_back() as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -603,7 +713,10 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        self.log_messages();
+        let message = self.log_messages();
+        if cfg!(test) {
+            assert_eq!(message, None, "the debug layer complains");
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1344,29 +1457,24 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// Copies `len` bytes from `src` to `dst`; false if the kernel found a page
+/// of either not accessible (what comes before it may be copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the kernel checks both ranges.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// Through `ReadProcessMemory` from our own process, for which the kernel
+/// checks the destination too: `WriteProcessMemory` took about 600 us per
+/// 64 KiB in a 174 MB heap, this about 8.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
+    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
     if len == 0 || write(dst as usize, len) {
         return;
     }

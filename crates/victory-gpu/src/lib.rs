@@ -20,6 +20,8 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(test, windows))]
+mod bench;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -49,6 +51,8 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod vram;
 #[cfg(windows)]
 mod watch;
 

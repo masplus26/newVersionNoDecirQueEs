@@ -937,3 +937,49 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// Two nested counted loops, `s0` times inside and `s1` times outside:
+/// `v0` is the inner iterations made in all.
+fn nested_loops() -> HostShader {
+    const S_ADD_U32: u8 = 0;
+    const ONE: u8 = 0x81;
+    // s_cmp_lt_u32 src0, src1; s_cbranch_scc1 by dwords.
+    let less = |a: u32, b: u32| 0xBF00_0000 | 0x0A << 16 | b << 8 | a;
+    let again = |dwords: i16| 0xBF85_0000 | u32::from(dwords as u16);
+    build_valu_cs(&[
+        s_mov_b32(6, 0x80),
+        s_mov_b32(12, 0x80),
+        s_mov_b32(7, 0x80), // the outer loop
+        sop2(S_ADD_U32, 7, 7, ONE), // the inner one
+        sop2(S_ADD_U32, 12, 12, ONE),
+        less(7, 0),
+        again(-4),
+        sop2(S_ADD_U32, 6, 6, ONE),
+        less(6, 1),
+        again(-8),
+        vop1(0x001, 0, sgpr(12)),
+    ])
+}
+
+/// The iteration limit holds for nested loops together: each within its own
+/// count, they would multiply to more than a GPU finishes. A lane past the
+/// limit leaves its loops.
+#[test]
+fn nested_loops_share_the_iteration_limit() {
+    let cases = [
+        [1, 1, 0, 0],
+        [500, 500, 0, 0],
+        [100_000, 1, 0, 0],
+        [1, 100_000, 0, 0],
+        // Four million in all, no loop near the limit by itself.
+        [2000, 2000, 0, 0],
+    ];
+    run_cases(&nested_loops(), &cases, |label, _, [inner, outer, ..], got| {
+        let total = inner * outer;
+        if total + outer < lower::LOOP_LIMIT {
+            assert_eq!(got, total, "{label}: {inner} x {outer}");
+        } else {
+            assert!(got <= lower::LOOP_LIMIT, "{label}: {inner} x {outer}: {got}");
+        }
+    });
+}
